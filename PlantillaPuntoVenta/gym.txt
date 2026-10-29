@@ -1,0 +1,1164 @@
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.image.BufferedImage;
+import java.io.File;
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import javax.imageio.ImageIO;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import javax.swing.table.DefaultTableModel;
+
+public class PuntoVenta extends JFrame {
+
+    // ======== Colores ========
+    static final Color TEAL      = new Color(0, 166, 166);
+    static final Color TEAL_DARK = new Color(62, 95, 91);
+    static final Color RED       = new Color(200, 70, 50);
+    static final Color ORANGE    = new Color(230, 150, 20);
+    static final Color OLIVE     = new Color(154, 176, 20);
+    static final Color GRIS_BTN  = new Color(80, 80, 80);
+    static final Color FONDO     = new Color(232, 232, 232);
+
+    /** Tallas disponibles para configurar en cada producto */
+    static final String[] TALLAS_STD = {"XS", "S", "M", "L", "XL", "XXL"};
+
+    // ======== Modelo ========
+    static class Producto {
+        int id;                       // 0 = aún no guardado en la BD
+        String nombre;
+        String codigoBarras;          // opcional, único
+        double precio;
+        String rutaImagen;
+        BufferedImage imagen;
+        boolean destacado, enDescuento;
+        /** talla -> stock. Si está vacío, el producto no maneja tallas. */
+        Map<String, Integer> tallas = new LinkedHashMap<>();
+
+        Producto(String nombre, double precio, String rutaImagen) {
+            this.nombre = nombre;
+            this.precio = precio;
+            setImagen(rutaImagen);
+        }
+
+        void setImagen(String ruta) {
+            this.rutaImagen = ruta;
+            this.imagen = null;
+            if (ruta != null) {
+                try { imagen = ImageIO.read(new File(ruta)); } catch (Exception e) { imagen = null; }
+            }
+        }
+
+        boolean tieneTallas() { return !tallas.isEmpty(); }
+
+        int stockTotal() {
+            int s = 0;
+            for (int v : tallas.values()) s += v;
+            return s;
+        }
+    }
+
+    static class ItemCarrito {
+        Producto producto;
+        String talla;                 // null si el producto no maneja tallas
+        int cantidad = 1;
+        ItemCarrito(Producto p, String talla) { this.producto = p; this.talla = talla; }
+        double total() { return producto.precio * cantidad; }
+        int stockDisponible() {
+            return talla == null ? Integer.MAX_VALUE : producto.tallas.getOrDefault(talla, 0);
+        }
+    }
+
+    // ================================================================
+    //  BASE DE DATOS (SQLite)
+    // ================================================================
+    static class BD {
+        private final Connection con;
+
+        BD(String archivo) throws SQLException {
+            con = DriverManager.getConnection("jdbc:sqlite:" + archivo);
+            try (Statement st = con.createStatement()) {
+                st.execute("PRAGMA foreign_keys = ON");
+                st.execute("CREATE TABLE IF NOT EXISTS productos ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        + "nombre TEXT NOT NULL,"
+                        + "precio REAL NOT NULL,"
+                        + "ruta_imagen TEXT,"
+                        + "destacado INTEGER NOT NULL DEFAULT 0,"
+                        + "en_descuento INTEGER NOT NULL DEFAULT 0)");
+                // Migración: agrega la columna codigo_barras si la BD es de una versión anterior
+                boolean tieneCodigo = false;
+                try (ResultSet rs = st.executeQuery("PRAGMA table_info(productos)")) {
+                    while (rs.next()) {
+                        if ("codigo_barras".equals(rs.getString("name"))) tieneCodigo = true;
+                    }
+                }
+                if (!tieneCodigo) st.execute("ALTER TABLE productos ADD COLUMN codigo_barras TEXT");
+                st.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_codigo_barras ON productos(codigo_barras)");
+                st.execute("CREATE TABLE IF NOT EXISTS tallas ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        + "producto_id INTEGER NOT NULL,"
+                        + "talla TEXT NOT NULL,"
+                        + "stock INTEGER NOT NULL DEFAULT 0,"
+                        + "UNIQUE(producto_id, talla),"
+                        + "FOREIGN KEY(producto_id) REFERENCES productos(id) ON DELETE CASCADE)");
+                st.execute("CREATE TABLE IF NOT EXISTS ventas ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        + "fecha TEXT NOT NULL DEFAULT (datetime('now','localtime')),"
+                        + "cliente TEXT,"
+                        + "metodo TEXT,"
+                        + "descuento REAL NOT NULL DEFAULT 0,"
+                        + "envio REAL NOT NULL DEFAULT 0,"
+                        + "total REAL NOT NULL,"
+                        + "nota TEXT)");
+                st.execute("CREATE TABLE IF NOT EXISTS venta_items ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        + "venta_id INTEGER NOT NULL,"
+                        + "producto_id INTEGER,"
+                        + "nombre TEXT NOT NULL,"
+                        + "talla TEXT,"
+                        + "cantidad INTEGER NOT NULL,"
+                        + "precio REAL NOT NULL,"
+                        + "FOREIGN KEY(venta_id) REFERENCES ventas(id) ON DELETE CASCADE)");
+            }
+        }
+
+        List<Producto> cargarProductos() throws SQLException {
+            List<Producto> lista = new ArrayList<>();
+            try (Statement st = con.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT id,nombre,precio,ruta_imagen,destacado,en_descuento,codigo_barras FROM productos ORDER BY id")) {
+                while (rs.next()) {
+                    Producto p = new Producto(rs.getString(2), rs.getDouble(3), rs.getString(4));
+                    p.id = rs.getInt(1);
+                    p.destacado = rs.getInt(5) == 1;
+                    p.enDescuento = rs.getInt(6) == 1;
+                    p.codigoBarras = rs.getString(7);
+                    lista.add(p);
+                }
+            }
+            try (PreparedStatement ps = con.prepareStatement(
+                    "SELECT talla,stock FROM tallas WHERE producto_id=? ORDER BY id")) {
+                for (Producto p : lista) {
+                    ps.setInt(1, p.id);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) p.tallas.put(rs.getString(1), rs.getInt(2));
+                    }
+                }
+            }
+            return lista;
+        }
+
+        void insertarProducto(Producto p) throws SQLException {
+            con.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = con.prepareStatement(
+                        "INSERT INTO productos(nombre,precio,ruta_imagen,destacado,en_descuento,codigo_barras) VALUES(?,?,?,?,?,?)",
+                        Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setString(1, p.nombre);
+                    ps.setDouble(2, p.precio);
+                    ps.setString(3, p.rutaImagen);
+                    ps.setInt(4, p.destacado ? 1 : 0);
+                    ps.setInt(5, p.enDescuento ? 1 : 0);
+                    ps.setString(6, p.codigoBarras);
+                    ps.executeUpdate();
+                    try (ResultSet k = ps.getGeneratedKeys()) { if (k.next()) p.id = k.getInt(1); }
+                }
+                guardarTallas(p);
+                con.commit();
+            } catch (SQLException e) {
+                con.rollback();
+                throw e;
+            } finally {
+                con.setAutoCommit(true);
+            }
+        }
+
+        void actualizarProducto(Producto p) throws SQLException {
+            con.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = con.prepareStatement(
+                        "UPDATE productos SET nombre=?,precio=?,ruta_imagen=?,destacado=?,en_descuento=?,codigo_barras=? WHERE id=?")) {
+                    ps.setString(1, p.nombre);
+                    ps.setDouble(2, p.precio);
+                    ps.setString(3, p.rutaImagen);
+                    ps.setInt(4, p.destacado ? 1 : 0);
+                    ps.setInt(5, p.enDescuento ? 1 : 0);
+                    ps.setString(6, p.codigoBarras);
+                    ps.setInt(7, p.id);
+                    ps.executeUpdate();
+                }
+                guardarTallas(p);
+                con.commit();
+            } catch (SQLException e) {
+                con.rollback();
+                throw e;
+            } finally {
+                con.setAutoCommit(true);
+            }
+        }
+
+        private void guardarTallas(Producto p) throws SQLException {
+            try (PreparedStatement del = con.prepareStatement("DELETE FROM tallas WHERE producto_id=?")) {
+                del.setInt(1, p.id);
+                del.executeUpdate();
+            }
+            try (PreparedStatement ins = con.prepareStatement(
+                    "INSERT INTO tallas(producto_id,talla,stock) VALUES(?,?,?)")) {
+                for (Map.Entry<String, Integer> e : p.tallas.entrySet()) {
+                    ins.setInt(1, p.id);
+                    ins.setString(2, e.getKey());
+                    ins.setInt(3, e.getValue());
+                    ins.executeUpdate();
+                }
+            }
+        }
+
+        void eliminarProducto(Producto p) throws SQLException {
+            try (PreparedStatement ps = con.prepareStatement("DELETE FROM productos WHERE id=?")) {
+                ps.setInt(1, p.id);
+                ps.executeUpdate();
+            }
+        }
+
+        /** Guarda la venta y descuenta el stock de cada talla (todo en una transacción). */
+        void registrarVenta(List<ItemCarrito> items, double descuento, double envio, double total,
+                            String metodo, String cliente, String nota) throws SQLException {
+            con.setAutoCommit(false);
+            try {
+                int ventaId;
+                try (PreparedStatement ps = con.prepareStatement(
+                        "INSERT INTO ventas(cliente,metodo,descuento,envio,total,nota) VALUES(?,?,?,?,?,?)",
+                        Statement.RETURN_GENERATED_KEYS)) {
+                    ps.setString(1, cliente);
+                    ps.setString(2, metodo);
+                    ps.setDouble(3, descuento);
+                    ps.setDouble(4, envio);
+                    ps.setDouble(5, total);
+                    ps.setString(6, nota);
+                    ps.executeUpdate();
+                    try (ResultSet k = ps.getGeneratedKeys()) { k.next(); ventaId = k.getInt(1); }
+                }
+                try (PreparedStatement ins = con.prepareStatement(
+                             "INSERT INTO venta_items(venta_id,producto_id,nombre,talla,cantidad,precio) VALUES(?,?,?,?,?,?)");
+                     PreparedStatement stock = con.prepareStatement(
+                             "UPDATE tallas SET stock = stock - ? WHERE producto_id=? AND talla=? AND stock >= ?")) {
+                    for (ItemCarrito it : items) {
+                        ins.setInt(1, ventaId);
+                        ins.setInt(2, it.producto.id);
+                        ins.setString(3, it.producto.nombre);
+                        ins.setString(4, it.talla);
+                        ins.setInt(5, it.cantidad);
+                        ins.setDouble(6, it.producto.precio);
+                        ins.executeUpdate();
+                        if (it.talla != null) {
+                            stock.setInt(1, it.cantidad);
+                            stock.setInt(2, it.producto.id);
+                            stock.setString(3, it.talla);
+                            stock.setInt(4, it.cantidad);
+                            if (stock.executeUpdate() == 0) {
+                                throw new SQLException("Stock insuficiente para " + it.producto.nombre
+                                        + " talla " + it.talla);
+                            }
+                        }
+                    }
+                }
+                con.commit();
+            } catch (SQLException e) {
+                con.rollback();
+                throw e;
+            } finally {
+                con.setAutoCommit(true);
+            }
+        }
+
+        List<Object[]> listarVentas() throws SQLException {
+            List<Object[]> filas = new ArrayList<>();
+            String sql = "SELECT v.id, v.fecha, v.cliente, v.metodo, v.total, "
+                    + "(SELECT group_concat(nombre || COALESCE(' [' || talla || ']','') || ' x' || cantidad, ', ') "
+                    + " FROM venta_items WHERE venta_id=v.id) "
+                    + "FROM ventas v ORDER BY v.id DESC";
+            try (Statement st = con.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+                while (rs.next()) {
+                    filas.add(new Object[]{rs.getInt(1), rs.getString(2), rs.getString(3),
+                            rs.getString(4), fmt(rs.getDouble(5)), rs.getString(6)});
+                }
+            }
+            return filas;
+        }
+    }
+
+    // ======== Estado ========
+    private final BD bd;
+    private final List<Producto> productos = new ArrayList<>();
+    private final List<ItemCarrito> carrito = new ArrayList<>();
+    private double descuento = 0;
+    private double envio = 0;
+    private String nota = "";
+
+    // ======== Componentes ========
+    private JPanel panelProductos;
+    private JPanel panelItems;
+    private JLabel lblSubtotal, lblTotal;
+    private JTextField txtBuscar;
+    private JTextField txtCliente, txtEmail, txtTelefono;
+    private String filtro = "Todo";
+
+    public PuntoVenta(BD bd) {
+        super("Punto de Venta");
+        this.bd = bd;
+        setDefaultCloseOperation(EXIT_ON_CLOSE);
+        setSize(1100, 760);
+        setLocationRelativeTo(null);
+        setLayout(new BorderLayout());
+
+        cargarDesdeBD();
+
+        add(crearBarraSuperior(), BorderLayout.NORTH);
+        JPanel centro = new JPanel(new GridLayout(1, 2));
+        centro.add(crearPanelIzquierdo());
+        centro.add(crearPanelDerecho());
+        add(centro, BorderLayout.CENTER);
+
+        refrescarProductos();
+        refrescarCarrito();
+    }
+
+    // ----------------------------------------------------------------
+    // CARGA INICIAL / DATOS DE EJEMPLO
+    // ----------------------------------------------------------------
+    private void cargarDesdeBD() {
+        try {
+            productos.addAll(bd.cargarProductos());
+            if (productos.isEmpty()) {
+                sembrarDemo();
+                productos.addAll(bd.cargarProductos());
+            }
+        } catch (SQLException e) {
+            error("Error al leer la base de datos:\n" + e.getMessage());
+        }
+    }
+
+    private void sembrarDemo() throws SQLException {
+        String[][] datos = {
+            {"ENDLESS SUM PT J BDSH KVJ7", "50", "0", "1"},
+            {"FIFTY50 LB", "50", "1", "0"},
+            {"SUNDAYS STRETCH LB", "55", "1", "0"},
+            {"EVDAYVL15 M JAMV KVJ0", "30", "0", "1"},
+            {"EVDAYVL15 M JAMV GPHH", "30", "0", "0"},
+            {"EVDAYVL15 M JAMV BSMH", "30", "0", "0"},
+            {"EVDAYVL15 M JAMV CPHH", "30", "0", "0"},
+            {"ISLANDPVL15 M JAMV BPZ6", "46", "0", "0"},
+            {"SUNFADVL17 M JAMV KTA6", "46", "1", "0"},
+        };
+        int n = 1;
+        for (String[] d : datos) {
+            Producto p = new Producto(d[0], Double.parseDouble(d[1]), null);
+            p.codigoBarras = String.format("775000000%04d", n++);   // códigos de ejemplo (EAN-13 estilo Perú)
+            p.destacado = d[2].equals("1");
+            p.enDescuento = d[3].equals("1");
+            for (String t : new String[]{"S", "M", "L", "XL"}) p.tallas.put(t, 10);
+            bd.insertarProducto(p);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // BARRA SUPERIOR
+    // ----------------------------------------------------------------
+    private JPanel crearBarraSuperior() {
+        JPanel barra = new JPanel(new BorderLayout());
+        barra.setBackground(TEAL_DARK);
+        barra.setPreferredSize(new Dimension(0, 36));
+
+        JPanel izq = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 6));
+        izq.setOpaque(false);
+        JButton menu = botonPlano("≡", TEAL);
+        menu.setPreferredSize(new Dimension(36, 30));
+        izq.add(menu);
+        izq.add(etiquetaBlanca("<html><b>Tienda:</b> PLAN BEACH &nbsp;&nbsp; <b>Caja registradora:</b> Caja1</html>"));
+        JButton ventas = linkBlanco("Ventas");
+        ventas.addActionListener(e -> mostrarVentas());
+        izq.add(ventas);
+
+        JPanel der = new JPanel(new FlowLayout(FlowLayout.RIGHT, 12, 4));
+        der.setOpaque(false);
+        der.add(etiquetaBlanca("👤 Jose Martinez"));
+        JButton cerrar = botonPlano("CERRAR SESIÓN", RED);
+        cerrar.setFont(cerrar.getFont().deriveFont(Font.BOLD, 10f));
+        cerrar.addActionListener(e -> {
+            if (JOptionPane.showConfirmDialog(this, "¿Cerrar sesión?", "Sesión",
+                    JOptionPane.YES_NO_OPTION) == JOptionPane.YES_OPTION) {
+                dispose();
+            }
+        });
+        der.add(cerrar);
+
+        barra.add(izq, BorderLayout.WEST);
+        barra.add(der, BorderLayout.EAST);
+        return barra;
+    }
+
+    private void mostrarVentas() {
+        try {
+            DefaultTableModel m = new DefaultTableModel(
+                    new String[]{"N°", "Fecha", "Cliente", "Método", "Total", "Artículos"}, 0) {
+                @Override public boolean isCellEditable(int r, int c) { return false; }
+            };
+            for (Object[] f : bd.listarVentas()) m.addRow(f);
+            JTable t = new JTable(m);
+            t.setRowHeight(24);
+            t.getColumnModel().getColumn(0).setPreferredWidth(40);
+            t.getColumnModel().getColumn(1).setPreferredWidth(130);
+            t.getColumnModel().getColumn(5).setPreferredWidth(420);
+            JScrollPane sp = new JScrollPane(t);
+            sp.setPreferredSize(new Dimension(900, 400));
+            JOptionPane.showMessageDialog(this, sp, "Historial de ventas", JOptionPane.PLAIN_MESSAGE);
+        } catch (SQLException e) {
+            error("No se pudo leer el historial:\n" + e.getMessage());
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // PANEL IZQUIERDO (catálogo)
+    // ----------------------------------------------------------------
+    private JPanel crearPanelIzquierdo() {
+        JPanel p = new JPanel(new BorderLayout(0, 8));
+        p.setBackground(FONDO);
+        p.setBorder(new EmptyBorder(10, 10, 10, 10));
+
+        JPanel arriba = new JPanel(new BorderLayout(10, 0));
+        arriba.setOpaque(false);
+        JLabel logo = new JLabel("<html><b style='color:#00a6a6'>POINT OF SALE</b></html>");
+        logo.setFont(logo.getFont().deriveFont(Font.BOLD, 14f));
+        txtBuscar = new JTextField();
+        txtBuscar.setPreferredSize(new Dimension(0, 30));
+        txtBuscar.setBorder(BorderFactory.createLineBorder(TEAL));
+        txtBuscar.setToolTipText("Busca por nombre, o escanea el código de barras y presiona Enter");
+        txtBuscar.addActionListener(e -> {          // un lector de código de barras envía Enter al terminar
+            Producto encontrado = buscarPorCodigo(txtBuscar.getText());
+            if (encontrado != null) {
+                txtBuscar.setText("");
+                agregarAlCarrito(encontrado);
+                refrescarProductos();
+            }
+        });
+        txtBuscar.addKeyListener(new KeyAdapter() {
+            @Override public void keyReleased(KeyEvent e) { refrescarProductos(); }
+        });
+        JButton qr = botonPlano("▦", GRIS_BTN);
+        qr.addActionListener(e -> escanear());
+        arriba.add(logo, BorderLayout.WEST);
+        arriba.add(txtBuscar, BorderLayout.CENTER);
+        arriba.add(qr, BorderLayout.EAST);
+
+        JPanel filtros = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 0));
+        filtros.setOpaque(false);
+        for (String n : new String[]{"Todo", "En descuento", "Destacado"}) {
+            JButton b = botonPlano(n, TEAL);
+            b.addActionListener(e -> { filtro = n; refrescarProductos(); });
+            filtros.add(b);
+        }
+        JButton add = botonPlano("+ Añadir producto", TEAL);
+        add.addActionListener(e -> editarProducto(null));
+        JButton scan = botonPlano("Escanear producto", TEAL);
+        scan.addActionListener(e -> escanear());
+        filtros.add(add);
+        filtros.add(scan);
+
+        JPanel norte = new JPanel(new BorderLayout(0, 10));
+        norte.setOpaque(false);
+        norte.add(arriba, BorderLayout.NORTH);
+        norte.add(filtros, BorderLayout.SOUTH);
+        p.add(norte, BorderLayout.NORTH);
+
+        panelProductos = new JPanel(new GridLayout(0, 3, 12, 12));
+        panelProductos.setBackground(FONDO);
+        JPanel contenedor = new JPanel(new BorderLayout());
+        contenedor.setBackground(FONDO);
+        contenedor.add(panelProductos, BorderLayout.NORTH);
+        JScrollPane sp = new JScrollPane(contenedor);
+        sp.setBorder(null);
+        sp.getVerticalScrollBar().setUnitIncrement(16);
+        sp.getViewport().setBackground(FONDO);
+        p.add(sp, BorderLayout.CENTER);
+        return p;
+    }
+
+    /** Busca un producto por código de barras exacto (null si no existe). */
+    private Producto buscarPorCodigo(String codigo) {
+        String c = codigo == null ? "" : codigo.trim();
+        if (c.isEmpty()) return null;
+        for (Producto p : productos) {
+            if (p.codigoBarras != null && p.codigoBarras.equalsIgnoreCase(c)) return p;
+        }
+        return null;
+    }
+
+    /** Escanear producto: pide el código de barras (o el nombre exacto) y lo agrega al carrito. */
+    private void escanear() {
+        String s = JOptionPane.showInputDialog(this, "Escanea o escribe el código de barras:");
+        if (s == null || s.trim().isEmpty()) return;
+        Producto p = buscarPorCodigo(s);
+        if (p == null) {
+            for (Producto o : productos) {
+                if (o.nombre.equalsIgnoreCase(s.trim())) { p = o; break; }
+            }
+        }
+        if (p != null) agregarAlCarrito(p);
+        else error("Producto no encontrado: " + s.trim());
+    }
+
+    private void refrescarProductos() {
+        panelProductos.removeAll();
+        panelProductos.add(new TarjetaProducto(null));
+
+        String q = txtBuscar == null ? "" : txtBuscar.getText().trim().toLowerCase();
+        for (Producto pr : productos) {
+            if (!q.isEmpty() && !pr.nombre.toLowerCase().contains(q)
+                    && !(pr.codigoBarras != null && pr.codigoBarras.toLowerCase().contains(q))) continue;
+            if (filtro.equals("En descuento") && !pr.enDescuento) continue;
+            if (filtro.equals("Destacado") && !pr.destacado) continue;
+            panelProductos.add(new TarjetaProducto(pr));
+        }
+        int celdas = panelProductos.getComponentCount();
+        while (celdas % 3 != 0) {
+            JPanel vacio = new JPanel();
+            vacio.setOpaque(false);
+            vacio.setPreferredSize(new Dimension(140, 140));
+            panelProductos.add(vacio);
+            celdas++;
+        }
+        panelProductos.revalidate();
+        panelProductos.repaint();
+    }
+
+    /** Tarjeta de producto con slot de imagen. producto == null => tarjeta "+" */
+    class TarjetaProducto extends JPanel {
+        private final Producto producto;
+
+        TarjetaProducto(Producto producto) {
+            this.producto = producto;
+            setPreferredSize(new Dimension(140, 140));
+            setCursor(new Cursor(Cursor.HAND_CURSOR));
+            if (producto != null) {
+                setToolTipText(producto.nombre + (producto.codigoBarras == null ? "" : "  |  Cód: " + producto.codigoBarras));
+            }
+            addMouseListener(new MouseAdapter() {
+                @Override public void mouseClicked(MouseEvent e) {
+                    if (SwingUtilities.isRightMouseButton(e) && producto != null) {
+                        menuContextual(e);
+                    } else if (SwingUtilities.isLeftMouseButton(e)) {
+                        if (producto == null) editarProducto(null);
+                        else agregarAlCarrito(producto);
+                    }
+                }
+            });
+        }
+
+        private void menuContextual(MouseEvent e) {
+            JPopupMenu menu = new JPopupMenu();
+            JMenuItem editar = new JMenuItem("Editar producto (tallas / stock)...");
+            editar.addActionListener(a -> editarProducto(producto));
+            JMenuItem cambiar = new JMenuItem("Cambiar imagen...");
+            cambiar.addActionListener(a -> {
+                String ruta = elegirImagen();
+                if (ruta != null) {
+                    producto.setImagen(ruta);
+                    try { bd.actualizarProducto(producto); }
+                    catch (SQLException ex) { error("No se pudo guardar:\n" + ex.getMessage()); }
+                    refrescarProductos();
+                    refrescarCarrito();
+                }
+            });
+            JMenuItem eliminar = new JMenuItem("Eliminar producto");
+            eliminar.addActionListener(a -> {
+                if (JOptionPane.showConfirmDialog(PuntoVenta.this,
+                        "¿Eliminar \"" + producto.nombre + "\"?", "Eliminar",
+                        JOptionPane.YES_NO_OPTION) != JOptionPane.YES_OPTION) return;
+                try {
+                    bd.eliminarProducto(producto);
+                    productos.remove(producto);
+                    carrito.removeIf(it -> it.producto == producto);
+                    refrescarProductos();
+                    refrescarCarrito();
+                } catch (SQLException ex) { error("No se pudo eliminar:\n" + ex.getMessage()); }
+            });
+            menu.add(editar);
+            menu.add(cambiar);
+            menu.add(eliminar);
+            menu.show(this, e.getX(), e.getY());
+        }
+
+        @Override protected void paintComponent(Graphics g0) {
+            Graphics2D g = (Graphics2D) g0.create();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            int w = getWidth(), h = getHeight();
+
+            if (producto == null) {
+                g.setColor(new Color(190, 190, 190));
+                g.fillRect(0, 0, w, h);
+                g.setColor(Color.WHITE);
+                g.setStroke(new BasicStroke(4));
+                g.drawLine(w / 2 - 18, h / 2, w / 2 + 18, h / 2);
+                g.drawLine(w / 2, h / 2 - 18, w / 2, h / 2 + 18);
+            } else {
+                g.setColor(Color.WHITE);
+                g.fillRect(0, 0, w, h);
+                if (producto.imagen != null) {
+                    dibujarImagenAjustada(g, producto.imagen, 0, 0, w, h);
+                } else {
+                    g.setColor(new Color(245, 245, 245));
+                    g.fillRect(0, 0, w, h);
+                    g.setColor(new Color(170, 170, 170));
+                    g.setFont(getFont().deriveFont(Font.BOLD, 13f));
+                    String t = "SIN IMAGEN";
+                    g.drawString(t, (w - g.getFontMetrics().stringWidth(t)) / 2, h / 2 - 10);
+                }
+                // Etiqueta de stock / agotado / descuento
+                g.setFont(getFont().deriveFont(Font.BOLD, 10f));
+                FontMetrics fm0 = g.getFontMetrics();
+                if (producto.tieneTallas()) {
+                    boolean agotado = producto.stockTotal() == 0;
+                    String s = agotado ? "AGOTADO" : "Stock: " + producto.stockTotal();
+                    g.setColor(agotado ? RED : TEAL);
+                    g.fillRect(0, 0, fm0.stringWidth(s) + 12, 16);
+                    g.setColor(Color.WHITE);
+                    g.drawString(s, 6, 12);
+                }
+                if (producto.enDescuento) {
+                    String s = "OFERTA";
+                    int bw = fm0.stringWidth(s) + 12;
+                    g.setColor(ORANGE);
+                    g.fillRect(w - bw, 0, bw, 16);
+                    g.setColor(Color.WHITE);
+                    g.drawString(s, w - bw + 6, 12);
+                }
+                // Franja inferior
+                int fh = 46;
+                g.setColor(new Color(90, 90, 90, 215));
+                g.fillRect(0, h - fh, w, fh);
+                g.setColor(Color.WHITE);
+                g.setFont(getFont().deriveFont(Font.BOLD, 11f));
+                FontMetrics fm = g.getFontMetrics();
+                String precio = fmt(producto.precio);
+                g.drawString(precio, w - fm.stringWidth(precio) - 6, h - fh + 14);
+                dibujarTextoEnVarias(g, producto.nombre, 6, h - fh + 14, w - 12 - fm.stringWidth(precio) - 6);
+            }
+            g.dispose();
+        }
+
+        private void dibujarTextoEnVarias(Graphics2D g, String texto, int x, int y, int ancho) {
+            FontMetrics fm = g.getFontMetrics();
+            String[] palabras = texto.split(" ");
+            StringBuilder linea = new StringBuilder();
+            int yy = y;
+            for (String pal : palabras) {
+                String prueba = linea.length() == 0 ? pal : linea + " " + pal;
+                if (fm.stringWidth(prueba) > ancho && linea.length() > 0) {
+                    g.drawString(linea.toString(), x, yy);
+                    yy += fm.getHeight() - 2;
+                    linea = new StringBuilder(pal);
+                } else {
+                    linea = new StringBuilder(prueba);
+                }
+            }
+            g.drawString(linea.toString(), x, yy);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // PANEL DERECHO (carrito)
+    // ----------------------------------------------------------------
+    private JPanel crearPanelDerecho() {
+        JPanel p = new JPanel(new BorderLayout());
+        p.setBackground(Color.WHITE);
+        JTabbedPane tabs = new JTabbedPane();
+        tabs.addTab("🛒 Carrito", crearPestanaCarrito());
+        tabs.addTab("👤 Cliente", crearPestanaCliente());
+        tabs.addTab("📍 Dirección", crearPestanaDireccion());
+        p.add(tabs, BorderLayout.CENTER);
+        return p;
+    }
+
+    private JPanel crearPestanaCarrito() {
+        JPanel p = new JPanel(new BorderLayout());
+        p.setBackground(Color.WHITE);
+
+        panelItems = new JPanel();
+        panelItems.setLayout(new BoxLayout(panelItems, BoxLayout.Y_AXIS));
+        panelItems.setBackground(Color.WHITE);
+        JPanel cont = new JPanel(new BorderLayout());
+        cont.setBackground(Color.WHITE);
+        cont.add(panelItems, BorderLayout.NORTH);
+        JScrollPane sp = new JScrollPane(cont);
+        sp.setBorder(null);
+        sp.getVerticalScrollBar().setUnitIncrement(16);
+        p.add(sp, BorderLayout.CENTER);
+
+        JPanel sur = new JPanel();
+        sur.setLayout(new BoxLayout(sur, BoxLayout.Y_AXIS));
+        sur.setBackground(Color.WHITE);
+        sur.setBorder(new EmptyBorder(8, 10, 10, 10));
+
+        lblSubtotal = new JLabel();
+        lblTotal = new JLabel();
+        lblTotal.setFont(lblTotal.getFont().deriveFont(Font.BOLD, 20f));
+        lblTotal.setForeground(TEAL);
+        JLabel tSub = new JLabel("SUBTOTAL (INCL. IMPUESTO)");
+        tSub.setFont(tSub.getFont().deriveFont(Font.BOLD, 10f));
+        lblSubtotal.setFont(lblSubtotal.getFont().deriveFont(Font.BOLD, 11f));
+        JLabel tTot = new JLabel("TOTAL");
+        tTot.setFont(tTot.getFont().deriveFont(Font.BOLD, 14f));
+        tTot.setForeground(TEAL);
+
+        sur.add(fila(tSub, lblSubtotal));
+        sur.add(Box.createVerticalStrut(8));
+        sur.add(new JSeparator());
+        sur.add(Box.createVerticalStrut(8));
+        sur.add(fila(tTot, lblTotal));
+        sur.add(Box.createVerticalStrut(10));
+
+        JButton vaciar = botonPlano("✕ VACIAR CARRITO", RED);
+        vaciar.addActionListener(e -> limpiarVenta());
+        JPanel filaVaciar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        filaVaciar.setOpaque(false);
+        filaVaciar.add(vaciar);
+        sur.add(filaVaciar);
+        sur.add(Box.createVerticalStrut(8));
+
+        JPanel botones = new JPanel(new GridBagLayout());
+        botones.setOpaque(false);
+        GridBagConstraints c = new GridBagConstraints();
+        c.fill = GridBagConstraints.BOTH;
+        c.weighty = 1;
+        c.insets = new Insets(0, 0, 0, 4);
+
+        JButton bNota = botonAccion("<html><center>🗒<br>AÑADIR<br>NOTA</center></html>", GRIS_BTN);
+        JButton bRec  = botonAccion("<html><center>+<br>AÑADIR<br>RECARGO O<br>DESCUENTO</center></html>", TEAL);
+        JButton bCup  = botonAccion("<html><center>🎟<br>APLICAR<br>CUPÓN</center></html>", TEAL);
+        JButton bEnv  = botonAccion("<html><center>🚚<br>ENVÍO</center></html>", TEAL);
+        JButton bSus  = botonAccion("<html><center>🛒<br>SUSPENDER Y<br>GUARDAR EL<br>CARRITO</center></html>", ORANGE);
+        JButton bPag  = botonPlano("PAGAR", OLIVE);
+        bPag.setFont(bPag.getFont().deriveFont(Font.PLAIN, 26f));
+
+        bNota.addActionListener(e -> {
+            String s = JOptionPane.showInputDialog(this, "Nota del pedido:", nota);
+            if (s != null) nota = s;
+        });
+        bRec.addActionListener(e -> {
+            String s = JOptionPane.showInputDialog(this,
+                    "Descuento en S/ (usa negativo para recargo):", descuento);
+            try { if (s != null) { descuento = Double.parseDouble(s.replace(",", ".")); refrescarCarrito(); } }
+            catch (NumberFormatException ex) { error("Número inválido"); }
+        });
+        bCup.addActionListener(e -> {
+            String s = JOptionPane.showInputDialog(this, "Código del cupón (ej: DESC10 = 10%):");
+            if (s == null) return;
+            if (s.equalsIgnoreCase("DESC10")) { descuento = subtotal() * 0.10; refrescarCarrito(); }
+            else error("Cupón no válido");
+        });
+        bEnv.addActionListener(e -> {
+            String s = JOptionPane.showInputDialog(this, "Costo de envío en S/:", envio);
+            try { if (s != null) { envio = Double.parseDouble(s.replace(",", ".")); refrescarCarrito(); } }
+            catch (NumberFormatException ex) { error("Número inválido"); }
+        });
+        bSus.addActionListener(e -> info("Carrito suspendido (pendiente de implementar)."));
+        bPag.addActionListener(e -> pagar());
+
+        JButton[] bs = {bNota, bRec, bCup, bEnv, bSus};
+        for (int i = 0; i < bs.length; i++) { c.gridx = i; c.weightx = 0.12; botones.add(bs[i], c); }
+        c.gridx = bs.length; c.weightx = 0.4; c.insets = new Insets(0, 0, 0, 0);
+        botones.add(bPag, c);
+        botones.setPreferredSize(new Dimension(0, 78));
+        botones.setMaximumSize(new Dimension(Integer.MAX_VALUE, 78));
+        sur.add(botones);
+
+        p.add(sur, BorderLayout.SOUTH);
+        return p;
+    }
+
+    private JPanel crearPestanaCliente() {
+        txtCliente = new JTextField();
+        txtEmail = new JTextField();
+        txtTelefono = new JTextField();
+        JPanel p = new JPanel(new GridLayout(0, 2, 8, 8));
+        p.setBorder(new EmptyBorder(20, 20, 20, 20));
+        p.setBackground(Color.WHITE);
+        p.add(new JLabel("Nombre:"));   p.add(txtCliente);
+        p.add(new JLabel("Email:"));    p.add(txtEmail);
+        p.add(new JLabel("Teléfono:")); p.add(txtTelefono);
+        JPanel wrap = new JPanel(new BorderLayout());
+        wrap.add(p, BorderLayout.NORTH);
+        wrap.setBackground(Color.WHITE);
+        return wrap;
+    }
+
+    private JPanel crearPestanaDireccion() {
+        JPanel p = new JPanel(new GridLayout(0, 2, 8, 8));
+        p.setBorder(new EmptyBorder(20, 20, 20, 20));
+        p.setBackground(Color.WHITE);
+        p.add(new JLabel("Dirección:")); p.add(new JTextField());
+        p.add(new JLabel("Ciudad:"));    p.add(new JTextField());
+        p.add(new JLabel("C.P.:"));      p.add(new JTextField());
+        JPanel wrap = new JPanel(new BorderLayout());
+        wrap.add(p, BorderLayout.NORTH);
+        wrap.setBackground(Color.WHITE);
+        return wrap;
+    }
+
+    // ----------------------------------------------------------------
+    // CARRITO + TALLAS
+    // ----------------------------------------------------------------
+    private void agregarAlCarrito(Producto p) {
+        String talla = null;
+        if (p.tieneTallas()) {
+            talla = elegirTalla(p);
+            if (talla == null) return;
+        }
+        for (ItemCarrito it : carrito) {
+            if (it.producto == p && Objects.equals(it.talla, talla)) {
+                if (it.cantidad + 1 > it.stockDisponible()) { error("Stock insuficiente en talla " + talla); return; }
+                it.cantidad++;
+                refrescarCarrito();
+                return;
+            }
+        }
+        carrito.add(new ItemCarrito(p, talla));
+        refrescarCarrito();
+    }
+
+    /** Muestra botones con las tallas que tienen stock. Devuelve la talla elegida o null. */
+    private String elegirTalla(Producto p) {
+        List<String> disp = new ArrayList<>();
+        List<String> etiquetas = new ArrayList<>();
+        for (Map.Entry<String, Integer> e : p.tallas.entrySet()) {
+            int enCarrito = 0;
+            for (ItemCarrito it : carrito) {
+                if (it.producto == p && e.getKey().equals(it.talla)) enCarrito += it.cantidad;
+            }
+            int libre = e.getValue() - enCarrito;
+            if (libre > 0) {
+                disp.add(e.getKey());
+                etiquetas.add(e.getKey() + "  (" + libre + ")");
+            }
+        }
+        if (disp.isEmpty()) { error("Producto agotado"); return null; }
+        int r = JOptionPane.showOptionDialog(this, "Elige la talla de " + p.nombre + "\n(entre paréntesis: stock)",
+                "Talla", JOptionPane.DEFAULT_OPTION, JOptionPane.QUESTION_MESSAGE, null,
+                etiquetas.toArray(), etiquetas.get(0));
+        return r < 0 ? null : disp.get(r);
+    }
+
+    private void refrescarCarrito() {
+        panelItems.removeAll();
+        for (ItemCarrito it : carrito) panelItems.add(filaCarrito(it));
+        panelItems.revalidate();
+        panelItems.repaint();
+        lblSubtotal.setText(fmt(subtotal()));
+        lblTotal.setText(fmt(total()));
+    }
+
+    private JPanel filaCarrito(ItemCarrito it) {
+        JPanel fila = new JPanel(new BorderLayout(10, 0));
+        fila.setBackground(Color.WHITE);
+        fila.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, new Color(225, 225, 225)),
+                new EmptyBorder(8, 8, 8, 12)));
+        fila.setMaximumSize(new Dimension(Integer.MAX_VALUE, 70));
+        fila.setPreferredSize(new Dimension(0, 70));
+
+        JPanel izq = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        izq.setOpaque(false);
+        JButton x = new JButton("✕");
+        x.setBorderPainted(false); x.setContentAreaFilled(false); x.setFocusPainted(false);
+        x.setForeground(Color.GRAY);
+        x.addActionListener(e -> { carrito.remove(it); refrescarCarrito(); });
+        izq.add(x);
+        izq.add(new Miniatura(it.producto));
+
+        String txtTalla = it.talla == null ? "" : "<br><small style='color:gray'>Talla: " + it.talla + "</small>";
+        JLabel nombre = new JLabel("<html><b>" + it.producto.nombre + "</b>" + txtTalla + "</html>");
+
+        JPanel der = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 12));
+        der.setOpaque(false);
+        JButton menos = botonPlano("−", TEAL);
+        JButton mas = botonPlano("+", TEAL);
+        menos.setPreferredSize(new Dimension(30, 28));
+        mas.setPreferredSize(new Dimension(30, 28));
+        JLabel cant = new JLabel(String.valueOf(it.cantidad), SwingConstants.CENTER);
+        cant.setPreferredSize(new Dimension(40, 28));
+        cant.setBorder(BorderFactory.createLineBorder(new Color(210, 210, 210)));
+        menos.addActionListener(e -> {
+            if (it.cantidad > 1) it.cantidad--; else carrito.remove(it);
+            refrescarCarrito();
+        });
+        mas.addActionListener(e -> {
+            if (it.cantidad + 1 > it.stockDisponible()) { error("Stock insuficiente en talla " + it.talla); return; }
+            it.cantidad++;
+            refrescarCarrito();
+        });
+        JLabel unit = new JLabel(fmt(it.producto.precio));
+        unit.setForeground(Color.GRAY);
+        JLabel tot = new JLabel(fmt(it.total()));
+        tot.setFont(tot.getFont().deriveFont(Font.BOLD, 14f));
+        tot.setPreferredSize(new Dimension(80, 28));
+        tot.setHorizontalAlignment(SwingConstants.RIGHT);
+        der.add(menos); der.add(cant); der.add(mas); der.add(unit); der.add(tot);
+
+        fila.add(izq, BorderLayout.WEST);
+        fila.add(nombre, BorderLayout.CENTER);
+        fila.add(der, BorderLayout.EAST);
+        return fila;
+    }
+
+    static class Miniatura extends JPanel {
+        private final Producto p;
+        Miniatura(Producto p) {
+            this.p = p;
+            setPreferredSize(new Dimension(44, 44));
+            setOpaque(false);
+        }
+        @Override protected void paintComponent(Graphics g0) {
+            Graphics2D g = (Graphics2D) g0.create();
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            if (p.imagen != null) dibujarImagenAjustada(g, p.imagen, 0, 0, getWidth(), getHeight());
+            else {
+                g.setColor(new Color(235, 235, 235));
+                g.fillRect(0, 0, getWidth(), getHeight());
+                g.setColor(Color.GRAY);
+                g.drawString("IMG", 11, 26);
+            }
+            g.dispose();
+        }
+    }
+
+    private double subtotal() {
+        double s = 0;
+        for (ItemCarrito it : carrito) s += it.total();
+        return s;
+    }
+
+    private double total() { return Math.max(0, subtotal() - descuento + envio); }
+
+    private void limpiarVenta() {
+        carrito.clear(); descuento = 0; envio = 0; nota = "";
+        refrescarCarrito();
+    }
+
+    private void pagar() {
+        if (carrito.isEmpty()) { error("El carrito está vacío"); return; }
+        String[] metodos = {"Efectivo", "Tarjeta", "Transferencia"};
+        Object m = JOptionPane.showInputDialog(this, "Total a pagar: " + fmt(total()) + "\nMétodo de pago:",
+                "Pagar", JOptionPane.PLAIN_MESSAGE, null, metodos, metodos[0]);
+        if (m == null) return;
+        try {
+            bd.registrarVenta(carrito, descuento, envio, total(), m.toString(),
+                    txtCliente.getText().trim(), nota);
+            // Reflejar el descuento de stock en memoria
+            for (ItemCarrito it : carrito) {
+                if (it.talla != null) it.producto.tallas.merge(it.talla, -it.cantidad, Integer::sum);
+            }
+            info("Venta registrada con " + m + " por " + fmt(total()));
+            limpiarVenta();
+            refrescarProductos();
+        } catch (SQLException ex) {
+            error("No se pudo registrar la venta:\n" + ex.getMessage());
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // CREAR / EDITAR PRODUCTO (imagen + tallas + stock)
+    // ----------------------------------------------------------------
+    private void editarProducto(Producto existente) {
+        boolean nuevo = existente == null;
+        Producto p = nuevo ? new Producto("", 0, null) : existente;
+
+        JTextField nombre = new JTextField(p.nombre, 18);
+        JTextField codigo = new JTextField(p.codigoBarras == null ? "" : p.codigoBarras);
+        JTextField precio = new JTextField(nuevo ? "" : String.valueOf(p.precio));
+        JCheckBox chkDest = new JCheckBox("Destacado", p.destacado);
+        JCheckBox chkDesc = new JCheckBox("En descuento (oferta)", p.enDescuento);
+
+        final String[] ruta = {p.rutaImagen};
+        JLabel lblRuta = new JLabel(ruta[0] == null ? "(sin imagen)" : new File(ruta[0]).getName());
+        JButton btnImg = new JButton("Elegir imagen...");
+        btnImg.addActionListener(e -> {
+            String r = elegirImagen();
+            if (r != null) { ruta[0] = r; lblRuta.setText(new File(r).getName()); }
+        });
+
+        // Tallas: casilla + stock
+        JCheckBox[] chk = new JCheckBox[TALLAS_STD.length];
+        JSpinner[] spin = new JSpinner[TALLAS_STD.length];
+        JPanel pTallas = new JPanel(new GridLayout(0, 2, 6, 4));
+        pTallas.setBorder(BorderFactory.createTitledBorder("Tallas y stock (sin marcar = sin tallas)"));
+        for (int i = 0; i < TALLAS_STD.length; i++) {
+            Integer stock = p.tallas.get(TALLAS_STD[i]);
+            chk[i] = new JCheckBox(TALLAS_STD[i], stock != null);
+            spin[i] = new JSpinner(new SpinnerNumberModel(stock == null ? 10 : stock, 0, 99999, 1));
+            spin[i].setEnabled(stock != null);
+            final int idx = i;
+            chk[i].addActionListener(e -> spin[idx].setEnabled(chk[idx].isSelected()));
+            pTallas.add(chk[i]);
+            pTallas.add(spin[i]);
+        }
+
+        JPanel datos = new JPanel(new GridLayout(0, 2, 6, 6));
+        datos.add(new JLabel("Código de barras:")); datos.add(codigo);
+        datos.add(new JLabel("Nombre:"));    datos.add(nombre);
+        datos.add(new JLabel("Precio (S/):")); datos.add(precio);
+        datos.add(btnImg);                   datos.add(lblRuta);
+        datos.add(chkDest);                  datos.add(chkDesc);
+
+        JPanel panel = new JPanel(new BorderLayout(0, 8));
+        panel.add(datos, BorderLayout.NORTH);
+        panel.add(pTallas, BorderLayout.CENTER);
+
+        int r = JOptionPane.showConfirmDialog(this, panel, nuevo ? "Nuevo producto" : "Editar producto",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        if (r != JOptionPane.OK_OPTION) return;
+
+        double pr;
+        try {
+            pr = Double.parseDouble(precio.getText().replace(",", "."));
+            if (nombre.getText().trim().isEmpty() || pr < 0) throw new NumberFormatException();
+        } catch (NumberFormatException ex) {
+            error("Nombre o precio inválido");
+            return;
+        }
+
+        String cod = codigo.getText().trim();
+        for (Producto o : productos) {
+            if (o != p && !cod.isEmpty() && cod.equalsIgnoreCase(o.codigoBarras)) {
+                error("Ese código de barras ya pertenece a: " + o.nombre);
+                return;
+            }
+        }
+
+        p.codigoBarras = cod.isEmpty() ? null : cod;
+        p.nombre = nombre.getText().trim().toUpperCase();
+        p.precio = pr;
+        p.destacado = chkDest.isSelected();
+        p.enDescuento = chkDesc.isSelected();
+        if (!Objects.equals(ruta[0], p.rutaImagen)) p.setImagen(ruta[0]);
+        p.tallas.clear();
+        for (int i = 0; i < TALLAS_STD.length; i++) {
+            if (chk[i].isSelected()) p.tallas.put(TALLAS_STD[i], (Integer) spin[i].getValue());
+        }
+
+        try {
+            if (nuevo) { bd.insertarProducto(p); productos.add(p); }
+            else bd.actualizarProducto(p);
+        } catch (SQLException ex) {
+            error("No se pudo guardar el producto:\n" + ex.getMessage());
+            return;
+        }
+        sanearCarrito();
+        refrescarProductos();
+        refrescarCarrito();
+    }
+
+    /** Ajusta el carrito si cambió el stock o se quitaron tallas. */
+    private void sanearCarrito() {
+        carrito.removeIf(it -> it.talla != null && !it.producto.tallas.containsKey(it.talla));
+        for (ItemCarrito it : carrito) {
+            if (it.cantidad > it.stockDisponible()) it.cantidad = Math.max(1, it.stockDisponible());
+        }
+    }
+
+    private String elegirImagen() {
+        JFileChooser fc = new JFileChooser();
+        fc.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
+                "Imágenes (png, jpg, gif)", "png", "jpg", "jpeg", "gif"));
+        if (fc.showOpenDialog(this) == JFileChooser.APPROVE_OPTION) {
+            return fc.getSelectedFile().getAbsolutePath();
+        }
+        return null;
+    }
+
+    // ----------------------------------------------------------------
+    // UTILIDADES
+    // ----------------------------------------------------------------
+    static void dibujarImagenAjustada(Graphics2D g, BufferedImage img, int x, int y, int w, int h) {
+        double esc = Math.min((double) w / img.getWidth(), (double) h / img.getHeight());
+        int iw = (int) (img.getWidth() * esc), ih = (int) (img.getHeight() * esc);
+        g.drawImage(img, x + (w - iw) / 2, y + (h - ih) / 2, iw, ih, null);
+    }
+
+    static String fmt(double v) {
+        return String.format(Locale.forLanguageTag("es-PE"), "S/ %,.2f", v);
+    }
+
+    private JButton botonPlano(String texto, Color fondo) {
+        JButton b = new JButton(texto);
+        b.setBackground(fondo);
+        b.setForeground(Color.WHITE);
+        b.setFont(b.getFont().deriveFont(Font.BOLD, 11f));
+        b.setFocusPainted(false);
+        b.setBorder(new EmptyBorder(8, 14, 8, 14));
+        b.setOpaque(true);
+        b.setContentAreaFilled(true);
+        b.setBorderPainted(false);
+        b.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        return b;
+    }
+
+    private JButton botonAccion(String html, Color fondo) {
+        JButton b = botonPlano(html, fondo);
+        b.setFont(b.getFont().deriveFont(Font.BOLD, 9f));
+        b.setBorder(new EmptyBorder(4, 2, 4, 2));
+        return b;
+    }
+
+    private JButton linkBlanco(String texto) {
+        JButton b = new JButton(texto);
+        b.setForeground(new Color(210, 225, 222));
+        b.setFont(b.getFont().deriveFont(Font.BOLD, 11f));
+        b.setBorderPainted(false);
+        b.setContentAreaFilled(false);
+        b.setFocusPainted(false);
+        b.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        return b;
+    }
+
+    private JLabel etiquetaBlanca(String t) {
+        JLabel l = new JLabel(t);
+        l.setForeground(Color.WHITE);
+        return l;
+    }
+
+    private JPanel fila(Component izq, Component der) {
+        JPanel p = new JPanel(new BorderLayout());
+        p.setOpaque(false);
+        p.add(izq, BorderLayout.WEST);
+        p.add(der, BorderLayout.EAST);
+        p.setMaximumSize(new Dimension(Integer.MAX_VALUE, 30));
+        return p;
+    }
+
+    private void info(String m) { JOptionPane.showMessageDialog(this, m, "Información", JOptionPane.INFORMATION_MESSAGE); }
+    private void error(String m) { JOptionPane.showMessageDialog(this, m, "Error", JOptionPane.ERROR_MESSAGE); }
+
+    // ----------------------------------------------------------------
+    public static void main(String[] args) {
+        try { UIManager.setLookAndFeel(UIManager.getCrossPlatformLookAndFeelClassName()); }
+        catch (Exception ignored) { }
+        SwingUtilities.invokeLater(() -> {
+            try {
+                BD bd = new BD("puntoventa.db");
+                new PuntoVenta(bd).setVisible(true);
+            } catch (SQLException e) {
+                JOptionPane.showMessageDialog(null,
+                        "No se pudo abrir la base de datos.\n"
+                        + "¿Agregaste el JAR sqlite-jdbc a las Libraries del proyecto?\n\n" + e.getMessage(),
+                        "Error de base de datos", JOptionPane.ERROR_MESSAGE);
+            }
+        });
+    }
+}
